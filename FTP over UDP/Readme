@@ -1,0 +1,371 @@
+                                 +-+-+-+-+-+-+
+                                 |R|E|A|D|M|E|
+                                 +-+-+-+-+-+-+
+Network Programming Assignment 2
+Team Members
+~~~~~~~~~~~~~
+ - Wadhawan, Ujjwal (107578996)
+ - Godugu, Jaya (108209853
+ - Su, Xinqi (108208641)
+
+Table of Contents
+~~~~~~~~~~~~~~~~~
+
+I.  Set Up
+II. Modifications & implementation
+ 1. Item 1. of the section Operation
+   a) Ensure only unicast addresses are bound
+   b) Implementation of the array of structures
+   c) Avoidance of replicate connection
+ 2. Item 1. of the section Adding Reliability to UDP
+   a) Modifications to the code of Section 22.5
+ 3. Item 2. of the section Adding Reliability to UDP
+   a) Implementation of the ARQ mechanism
+   b) Race Condition
+   c) Cumulative ACK
+ 4. Item 5. of the section Adding Reliability to UDP
+   a) Solutions to notification of the last datagram, clean closing and so on
+ 5. Client Implementation notes
+   a) Client Invocation
+   b) Client Implementation
+
+5. Referencess
+
+~~~~~~~~~~~~~~~~~
+
+I. Get source code from .tar file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ tar xvf Assignment2.tar
+ run make all
+
+II. Modifications & implementation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Item 1. of the section Operation
+-----------------------------------
+ a) Ensure only unicast addresses are bound
+    As we only use ifi_addr while getting sa_ip, we don't use ifi_brdaddr or
+    ifi_dstaddr. Therefore we only bind unicast here.
+    sa_ip = (struct sockaddr_in*) (ifi->ifi_addr);
+
+ b) Implementation of the array of structures
+    The array of structures is implemented to record the following information
+    for each socket.
+    typedef struct sock_array
+    {
+        int sockfd;
+        char ip_address[INET_ADDRSTRLEN];
+        char subnet_mask[INET_ADDRSTRLEN];
+        char host_network[INET_ADDRSTRLEN];
+    }sock_array_st;
+
+    MAX_IF is set to 10 for the maximum size of the array of this structure.
+    sock_array_st sock_array[MAX_IF];
+
+    For each IP address the server has, it creates a socket, bind the socket
+    with the IP address and record to this array of structures.
+    for (ifihead = ifi = Get_ifi_info_plus(family, doaliases);(ifi != NULL)
+           && (if_counter < MAX_IF) ; ifi = ifi->ifi_next){
+        ...
+        int sockfd = Socket(AF_INET,SOCK_DGRAM,0);
+	...
+	sock_array[if_counter].sockfd = sockfd;
+        strcpy(sock_array[if_counter].ip_address,ip_address);
+        strcpy(sock_array[if_counter].subnet_mask,subnet_mask);
+        strcpy(sock_array[if_counter].host_network,host_network);
+        ...
+      }
+
+ c) Avoidance of replicate connection
+    A function of check_and_add_conn is implemented to ensure
+    no existing connection will consume a new server child to
+    process.
+    A variable tracker is used to record all the existing connection.
+    It is a linked list. It is searched to see whether the connection
+    already exist.
+
+    if(tracker_begin == NULL)
+    {
+    ...
+    } else {
+       tmp = tracker_begin;
+       int count=0;
+       while(tmp != NULL)
+       {
+          if((tmp->track_port == client_port)
+             && (strcmp(tmp->track_ip, IPClient) == 0))
+    ...
+
+
+2. Item 1. of the section Adding Reliability to UDP
+---------------------------------------------------
+ a) Modifications to the code of Section 22.5
+    In unprtt.h
+    - struct rtt_info {
+      int   rtt_rtt;            /* most recent measured RTT, in seconds */
+      int   rtt_srtt;           /* smoothed RTT estimator, in seconds */
+      int   rtt_rttvar;         /* smoothed mean deviation, in seconds */
+      int     rtt_rto;            /* current RTO to use, in seconds */
+      int     rtt_nrexmt;         /* # times retransmitted: 0, 1, 2, ... */
+      uint32_t rtt_base;          /* # sec since 1/1/1970 at start */
+      };
+
+    In rtt.c
+
+   - #define    RTT_RTOCALC(ptr) ((ptr)->rtt_srtt + (4.0 * (ptr)->rtt_rttvar))
+   --> #define    RTT_RTOCALC(ptr) ((ptr)->rtt_srtt + (4 * (ptr)->rtt_rttvar))
+
+   - In rtt_stop():
+     double delta; --> int delta;
+     ptr->rtt_rtt = ms / 1000.0;  --> ptr->rtt_rtt = ms / 1000;
+     if (delta < 0.0)  --> if (delta < 0)
+
+   - In rtt_minmax():
+     static float rtt_minmax(float rto) --> static int rtt_minmax(int rto)
+
+
+   - In rtt_init():
+     ptr->rtt_rttvar = 0.75; --> ptr->rtt_rttvar = 750;
+
+   - In rtt_start():
+     return((int) (ptr->rtt_rto + 0.5)); --> return prt->rtt_rto;
+
+   - In rtt_debug():
+     fprintf(stderr, "rtt = %.3f, srtt = %.3f, rttvar = %.3f,
+     rto = %.3f\n", ptr->rtt_rtt, ptr->rtt_srtt, ptr->rtt_rttvar, ptr->rtt_rto);
+     --> fprintf(stderr, "rtt = %d, srtt = %d, rttvar = %d,
+     rto = %d\n", ptr->rtt_rtt, ptr->rtt_srtt, ptr->rtt_rttvar, ptr->rtt_rto);
+
+  In server.c
+   - alarm() --> setitimer()
+
+3. Item 2. of the section Adding Reliability to UDP
+----------------------------------------------------
+
+    a) Implementation of the ARQ mechanism
+       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+       The structure of the datagram is as follows:
+       typedef struct dgram{
+          int seqNum;
+          int ackNum;
+          int EOFFlag;
+          int windowSize;
+          int datasize;
+          char buf[512 - (5*sizeof(int))];
+       }dgram;
+       Therefore the data size within a datagram is actually
+       (512 - (5*sizeof(int))).
+
+       Slding window mechanism on client side:
+       The client side maintains a window which is of size MAX_WIN_SIZE.
+       It is an array of structures of type datagram.
+       struct dgram* window[MAX_WIN_SIZE];
+
+       There are two threads: the producer(main) thread and the consumer thread.
+       Whenever the client receives new datagram of the file content, the
+       producer thread puts datagram to the circular buffer to the position
+       of the remainder of the window size dividing the sequence number of
+       the package(i.e. sequence number of the package % window size). It
+       then decrease the window size by 1. If the position of the buffer is
+       not null when the producer attempts to put one new datagram, the
+       client will drop the package.
+
+       if(window[blob->seqNum%recv_sw_size] != NULL)
+       {
+          printf("\n^^^^^^^^^^^^^^^^ X DROP Receiving - Congestion on
+                  Reciever^^^^^^^^^^^^^^^^\n");
+          free(blob);
+       }
+       else
+       {
+          window[blob->seqNum%recv_sw_size] = blob;
+          orecv_sw_size--;
+          expectedDgramSeq++;
+          sendDgram.ackNum = expectedDgramSeq;
+          sendDgram.windowSize = orecv_sw_size;
+       }
+
+       The consumer thread reads from the buffer continuously until
+       it gets stuck when the next datagram is null. The consumer
+       sleeps and waits for the signal from the producer until the
+       producer puts new datagram to this buffer.
+
+       Pthread_cond_wait (&cond, &buflock);
+
+
+    b) Race Condition
+       ~~~~~~~~~~~~~~~
+
+       Before the producer writes to the buffer, it uses mutex to lock
+       the buffer. After, it unlocks the buffer.
+       Pthread_mutex_lock(&buflock);
+       ...
+       Pthread_mutex_unlock(&buflock);
+
+    c) Cumulative ACK
+       ~~~~~~~~~~~~~~
+
+       The client sends ACK whenever it receives a new datagram. The ACK
+       contains the latest sequence number plus 1 and the available window
+       size left. If the buffer is full, the client will send ACK with a
+       window size of 0 and the number which it sends last time(the latest
+       sequence plus 1).
+
+
+4. Item 5. of the section Adding Reliability to UDP
+----------------------------------------------------
+
+    a) Solutions to notification of the last datagram, clean closing and so on
+       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+       We use EOFFlag bit to denote the last datagram. When the client
+       receives the datagram with EOFFlag bit, it will prepare to terminate.
+
+       However, the client will not terminate immediatly after it receives EOF
+       from the server. It will wait until the consumer finishes reading the
+       buffer. Here we use ChildFin to denote the status of consumer thread:
+       while(childFin!=1)
+       {
+          Pthread_cond_signal(&cond);
+          sleep(1);
+       }
+
+5. Client Implementation notes
+-------------------------------
+
+    a) Client Invocation:
+       Create input files client.in and server.in as per spec
+       Promt$> client
+
+    b) Client Implementation:
+       Input: The client application reads the client.in  and server.in
+       input files. Allocates memory for the input variables and saves
+       them for further use.
+       if(readConfig() != 1)
+       {
+            printf("Error in Config File\n");
+            exit(0);
+       }
+
+    Unique serverIP/port & ClienIP/Port:
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    The  get_ifi_info function has
+    been modified to incorporate network masks. Using this function client
+    determines whether the server is on  the local host or in the subnet or
+    on a different network.  If it is on the local host it configures the
+    DONTROUTE option. If the server is not on local host the client uses the
+    server’s address specified by the input file. The client outputs the
+    IP addresses of the client and server on the stdout.
+
+    for (ifihead = ifi = Get_ifi_info_plus(family, doaliases);
+        (ifi != NULL) && (if_counter < MAX_IF) ; ifi = ifi->ifi_next)
+
+    Client creates an UDP socket and binds it to IPclient. It issues a connect
+    to the  IPserver address. Prints out the IPclient and IPserver addresses
+    and port numbers using getsockname function. The function getpeername is
+    used to get the servers IPaddress and same is printed out on the
+    stdout and written to a file as well.
+
+    #####################################################
+    Getsockname(sockfd, (SA*) &client, &socksize);
+    ...
+    Bind(sockfd, (SA*) &client, sizeof(struct sockaddr_in));
+    ...
+    if(connect(sockfd, (SA*)&server, sizeof(struct sockaddr_in)) < 0)
+    if(getpeername(sockfd,(SA*) &server, &socksize) < 0)
+
+    Initial file transfer datagram: Client sends the initial filetransfer
+    udp message and receives the ack packet from the server
+
+    newport = send_filename_and_get_server_port(file_name, flags, sockfd);
+        printf("   Server NEW PORT - %d\n",newport);
+    bzero(&server, sizeof(struct sockaddr_in));
+    server.sin_family = AF_INET;
+    server.sin_port = htons(newport);
+    Inet_pton(AF_INET,IPServer,&server.sin_addr);
+    if(connect(sockfd, (SA*)&server, sizeof(struct sockaddr_in)) < 0)
+    {
+       printf("Error : Server connect %d\n", errno);
+       exit(0);
+    }
+    if(send(sockfd,ACKNOWLEDGEMENT,strlen(ACKNOWLEDGEMENT),flags)<0)
+    {
+       printf("Error : send() %d\n", errno);
+    }
+    #####################################################
+
+    Receive data/send ack/flowcontol/packet loss/ack loss/sleep: A thread is
+    created to receive the data in the form of datagrams from the server and
+    to send ack datagrams. Flow control has been implemented using a sliding
+    window and recive and send variables along with the window size. Data loss
+    or ack loss is simulated by using a random generator.  The receive thread
+    sleeps based on the formula formula    -1 x miu x ln( random( ) )
+
+    Pthread_create(&pid,NULL,&consumer,NULL);
+    ...
+    while(1)
+    {
+        struct dgram * blob = NULL;
+        // Here is where we will recieve and send data
+        len = recvfrom(sockfd, &recvDgram, dgramLen, flags,(SA*)&server, &sz);
+        if(len < 0)
+        {
+           printf("Error in recvfrom\n");
+        }
+        printf("expectedDgramSeq = %d, recvDgram.seqNum = %d\n",
+                expectedDgramSeq,recvDgram.seqNum);
+        if(expectedDgramSeq == recvDgram.seqNum)
+        {
+           struct dgram * blob = (struct dgram*)malloc(sizeof (struct dgram));
+           memset(blob, 0,sizeof (struct dgram));
+           memcpy(blob->buf,recvDgram.buf,recvDgram.datasize);
+
+           blob->seqNum=recvDgram.seqNum;
+           blob->windowSize=recvDgram.windowSize;
+           blob->EOFFlag=recvDgram.EOFFlag;
+           if(can_receive_dtagram(prob_datagram_loss ,rand_seed))
+           {
+              printf("----> ALLOW Receiving -- Data Seq no. %d\n",
+                      recvDgram.seqNum);
+              Pthread_mutex_lock(&buflock);
+              if(window[blob->seqNum%recv_sw_size] != NULL)
+              {
+                 printf("\n^^^^^^^^^^^^^^^^ X DROP Receiving -
+                         Congestion on Reciever^^^^^^^^^^^^^^^^\n");
+                 free(blob);
+              }
+              ...
+           }
+    }
+
+    Print thread:
+    ~~~~~~~~~~~~~
+    The print thread extracts the data from the received
+    datagrams and spits it out on the stdout.
+
+    while(fileReadWindowCounter < expectedDgramSeq)
+    {
+         index = fileReadWindowCounter % recv_sw_size;
+         fprintf(fpo,"%s", window[fileReadWindowCounter % recv_sw_size]->buf);
+         printf("Consumer Read Packet No: %d\n", fileReadWindowCounter);
+         window[fileReadWindowCounter % recv_sw_size] = NULL;
+         orecv_sw_size++;
+         fileReadWindowCounter++;
+    }
+    Pthread_mutex_unlock(&buflock);
+
+   Variable sharing across threads:
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   A mutex lock has been implemented
+   between the receive and print threads to use the receive buffers
+   without any clash between the threads.
+
+      Pthread_mutex_lock(&buflock);
+      Pthread_cond_wait (&cond, &buflock);
+
+
+
+
